@@ -1,58 +1,74 @@
-use nannou::prelude::*;
-use nannou::ui::prelude::*;
 use nannou_osc as osc;
 use nannou_osc::Type;
 use midir::{MidiInput, Ignore};
-use std::io::{stdin, stdout, Write};
-use std::error::Error;
-use crossbeam::crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use std::thread;
-use std::env;
 use clap;
 
+use std::io;
+use tui::Terminal;
+use tui::backend::CrosstermBackend;
 
-fn main() {
+use tui::{
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Gauge, Sparkline},
+};
 
-    nannou::app(model)
-        .update(update)
-        .simple_window(view)
-        .run();
+use crossterm::{
+    event::{self, EnableMouseCapture, Event as CEvent, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
+
+use std::{
+    error::Error,
+    io::{stdin, stdout, Write},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
+
+enum Event<I> {
+    Input(I),
+    Tick,
+    MidiEvent(Vec<u8>),
 }
 
-#[derive(Debug)]
-pub enum ThreadState{
-    Loading,
-    SelectPortRequest,
-    Running,
+struct App {
+    progress: u16,
+    notes: Vec<u64>,
+    cc: Vec<u64>,
 }
 
-struct Model {
-    ui: Ui,
-    ids: Ids,
-    resolution: u8,
-    thread_state: ThreadState,
-    sender: Sender<ThreadState>,
-    receiver: Receiver<ThreadState>,
-    midi_receiver: Receiver<MidiMsg>,
-}
-
-widget_ids! {
-    struct Ids {
-        resolution,
-        scale,
-        rotation,
-        random_color,
-        position,
+impl App {
+    fn new() -> App {
+        let mut notes = vec![0];
+        let mut cc = vec![0];
+        App {
+            progress: 0,
+            notes,
+            cc,
+        }
     }
+
+    fn update(&mut self) {
+        if(self.notes.len() >=200){
+            self.notes.pop();
+        }
+        self.notes.insert(0, 1);
+    }
+
+    fn note_on(&mut self, ch: u8, note: u8, vel: u8) {
+        if(self.notes.len() >=200){
+            self.notes.pop();
+        }
+        self.notes.insert(0, note.into());
+    }
+
+
 }
 
-pub enum MidiMsg {
-    NoteOn(u8,u8,u8),
-    NoteOff(u8,u8),
-    ControlChange(u8,u8,u8),
-}
 
-fn model(app: &App) -> Model {
+fn main() -> Result<(), Box<dyn Error>> {
 
     let matches = clap::App::new("My Super Program")
         .version("0.1")
@@ -72,118 +88,16 @@ fn model(app: &App) -> Model {
             .takes_value(true))
         .get_matches();
 
-
     let port: u16 = matches.value_of_t("port").unwrap_or(9000);
-    let midi_input: Option<u8> = match matches.value_of_t("input") {
+    let midi_input: Option<usize> = match matches.value_of_t("input") {
         Ok(v) => Some(v),
         Err(_) => None,
     };
 
-    let (sender_t, receiver) = bounded::<ThreadState>(1);
-    let (sender, receiver_t) = bounded::<ThreadState>(1);
-    let (midi_sender, midi_receiver) = unbounded::<MidiMsg>();
-
-    thread::spawn(move || match comm_thread(port, midi_input, sender_t, receiver_t, midi_sender) {
-        Ok(_) => (),
-        Err(err) => println!("Error: {}", err),
-    });
-
-    // Set the loop mode to wait for events, an energy-efficient option for pure-GUI apps.
-    app.set_loop_mode(LoopMode::Wait);
-
-    // Create the UI.
-    let mut ui = app.new_ui().build().unwrap();
-
-    // Generate some ids for our widgets.
-    let ids = Ids::new(ui.widget_id_generator());
-
-    // Init our variables
-    let resolution = 6;
-
-    Model {
-        ui,
-        ids,
-        resolution,
-        thread_state: ThreadState::Loading, 
-        sender, 
-        receiver, 
-        midi_receiver
-    }
-
-}
-
-fn update(_app: &App, model: &mut Model, _update: Update) {
-
-    // Calling `set_widgets` allows us to instantiate some widgets.
-    let ui = &mut model.ui.set_widgets();
-
-    match model.receiver.try_recv() {
-        Ok(s) => { model.thread_state = s;}
-        _ => {}
-    }
-
-    match model.thread_state {
-        ThreadState::Loading => {
-        },
-        ThreadState::SelectPortRequest => {
-        },
-        ThreadState::Running => {
-            let midi_messages: Vec<MidiMsg> = model.midi_receiver.try_iter().collect();
-            for m in midi_messages {
-                match m {
-                    MidiMsg::NoteOn(ch,note,vel) => { println!("note on {} {} {} ", ch,note, vel);}
-                    MidiMsg::NoteOff(ch,note) => { println!("note off {} {}", ch,note);}
-                    MidiMsg::ControlChange(ch,num,val) => { println!("cc {} {} {}", ch,num,val);}
-                }
-            }
-        }
-    }
-
-}
-
-fn view(app: &App, model: &Model, frame: Frame) {
-
-    let draw = app.draw();
-
-    match model.thread_state {
-        ThreadState::Loading => {
-            draw.background().color(RED);
-        },
-        ThreadState::SelectPortRequest => {
-            draw.background().color(BLUE);
-        },
-        ThreadState::Running => {
-            draw.background().color(PLUM);
-        }
-    }
-
-    // Write the result of our drawing to the window's frame.
-    draw.to_frame(app, &frame).unwrap();
-
-    // Draw the state of the `Ui` to the frame.
-    model.ui.draw_to_frame(app, &frame).unwrap();
-
-}
-
-
-
-pub fn comm_thread(
-        port: u16, 
-        midi_input: Option<u8>, 
-        sender: Sender<ThreadState>, 
-        receiver: Receiver<ThreadState>, 
-        midi_sender: Sender<MidiMsg>
-    ) -> Result<(), Box<dyn Error>> {
-
-    let mut input = String::new();
     let mut midi_in = MidiInput::new("midir reading input")?;
     midi_in.ignore(Ignore::None);
 
-    // The osc-sender expects a string in the format "address:port", for example "127.0.0.1:1234"
-    // "127.0.0.1" is equivalent to your computers internal address.
     let target_addr = format!("{}:{}", "127.0.0.1", port);
-
-    // This is the osc Sender which contains a couple of expectations in case something goes wrong.
     let osc_sender = osc::sender()
         .expect("Could not bind to default socket")
         .connect(target_addr)
@@ -192,57 +106,157 @@ pub fn comm_thread(
     // Get an input port (read from console if multiple are available)
     let in_ports = midi_in.ports();
 
-    sender.send(ThreadState::SelectPortRequest).unwrap();
-
     let in_port = match in_ports.len() {
         0 => return Err("no input port found".into()),
-        1 => {
-            println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
-            &in_ports[0]
-        },
         _ => {
-            println!("\nAvailable input ports:");
-            for (i, p) in in_ports.iter().enumerate() {
-                println!("{}: {}", i, midi_in.port_name(p).unwrap());
+            match midi_input {
+                Some(index) => {
+                    if(index < in_ports.len()){
+                        println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
+                        &in_ports[index]
+                    }
+                    else{
+                        return Err("input port out of range".into());
+                    }
+                }
+                None => {
+                    if(in_ports.len()==1){
+                        println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
+                        &in_ports[0]
+                    }
+                    else{
+                        println!("\nAvailable input ports:");
+                        for (i, p) in in_ports.iter().enumerate() {
+                            println!("{}: {}", i, midi_in.port_name(p).unwrap());
+                        }
+                        print!("Please select input port: ");
+                        stdout().flush()?;
+                        let mut input = String::new();
+                        stdin().read_line(&mut input)?;
+                        in_ports.get(input.trim().parse::<usize>()?)
+                                 .ok_or("invalid input port selected")?
+                    }
+                }
             }
-            print!("Please select input port: ");
-            stdout().flush()?;
-            let mut input = String::new();
-            stdin().read_line(&mut input)?;
-            in_ports.get(input.trim().parse::<usize>()?)
-                     .ok_or("invalid input port selected")?
         }
     };
 
-    println!("\nOpening connection");
+    enable_raw_mode()?;
+    // Terminal initialization
+    let mut stdout = stdout();
 
+    execute!(stdout, EnableMouseCapture)?;
+
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Setup input handling
+    let (tx, rx) = mpsc::channel();
+
+    let tx2 = tx.clone();
     // _conn_in needs to be a named parameter, because it needs to be kept alive until the end of the scope
     let _conn_in = midi_in.connect(
         in_port,
         "midir-read-input",
         move |_, msg, _| {
-
-            if msg.len() == 3 {
-                if msg[0] == 0x90 {
-                    midi_sender.send(MidiMsg::NoteOn(0,msg[1],msg[2])).unwrap();
-                    let osc_addr = "/circle/position".to_string();
-                    let args = vec![Type::Int(0)];
-                    let packet = (osc_addr, args);
-                    osc_sender.send(packet).ok();
-                } else if msg[0] == 0x80 {
-                    midi_sender.send(MidiMsg::NoteOff(0,msg[1])).unwrap();
-                } else if msg[0] == 0xB0 {
-                    midi_sender.send(MidiMsg::ControlChange(0,msg[1],msg[2])).unwrap();
-                }
-            }
-
+            tx2.send(Event::MidiEvent(msg.to_vec())).unwrap();
         },
         (),
     )?;
 
-    input.clear();
-    stdin().read_line(&mut input)?; // wait for next enter key press
+    let tick_rate = Duration::from_millis(200);
+    thread::spawn(move || {
+        let mut last_tick = Instant::now();
+        loop {
+            // poll for tick rate duration, if no events, sent tick event.
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(0));
+            if event::poll(timeout).unwrap() {
+                if let CEvent::Key(key) = event::read().unwrap() {
+                    tx.send(Event::Input(key)).unwrap();
+                }
+            }
+            if last_tick.elapsed() >= tick_rate {
+                tx.send(Event::Tick).unwrap();
+                last_tick = Instant::now();
+            }
+        }
+    });
 
-    println!("Closing connection");
+    let mut app = App::new();
+
+    terminal.clear()?;
+
+    loop {
+        terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .margin(2)
+                .constraints(
+                    [
+                        Constraint::Percentage(25),
+                        Constraint::Percentage(25),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(7),
+                        Constraint::Min(0),
+                    ]
+                    .as_ref(),
+                )
+                .split(f.size());
+
+            let sparkline = Sparkline::default()
+                .block(
+                    Block::default()
+                        .title("NOTES")
+                        .borders(Borders::LEFT | Borders::RIGHT),
+                )
+                .data(&app.notes)
+                .max(127)
+                .style(Style::default().fg(Color::Yellow));
+            f.render_widget(sparkline, chunks[0]);
+
+        })?;
+
+        match rx.recv()? {
+            Event::Input(event) => match event.code {
+                KeyCode::Char('q') => {
+                    terminal.clear()?;
+                    break;
+                }
+                _ => {}
+            },
+            Event::Tick => {
+                app.update();
+            },
+            Event::MidiEvent(msg) => {
+                if msg.len() == 3 {
+                    if msg[0] == 0x90 {
+                        let ch = msg[0];
+                        let note = msg[1];
+                        let vel = msg[2];
+                        let addr = format!("/note/{}/{}", ch, note);
+                        let args = vec![Type::Int(vel.into())];
+                        let packet = (addr, args);
+                        osc_sender.send(packet).ok();
+                        app.note_on(ch, note, vel);
+                    } else if msg[0] == 0x80 {
+                    } else if msg[0] == 0xB0 {
+                    }
+                }
+
+            }
+        }
+
+    }
+
+    disable_raw_mode();
+
     Ok(())
 }
+
+
+
+
