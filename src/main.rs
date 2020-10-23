@@ -1,224 +1,248 @@
-extern crate midir;
+use nannou::prelude::*;
+use nannou::ui::prelude::*;
+use nannou_osc as osc;
+use nannou_osc::Type;
+use midir::{MidiInput, Ignore};
+use std::io::{stdin, stdout, Write};
+use std::error::Error;
+use crossbeam::crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use std::thread;
+use std::env;
+use clap;
 
-use std::fmt;
-use std::time::{Duration, Instant};
 
-use midir::{MidiInput, Ignore, MidiInputPort};
+fn main() {
 
-use iced::{
-    executor, Align, Application, Checkbox, Column, Command, Container,
-    Element, Length, Settings, Subscription, Text, HorizontalAlignment,
-};
-
-pub fn main() {
-    Midiosch::run(Settings::default())
+    nannou::app(model)
+        .update(update)
+        .simple_window(view)
+        .run();
 }
 
-enum Midiosch {
+#[derive(Debug)]
+pub enum ThreadState{
     Loading,
-    Loaded(State),
+    SelectPortRequest,
+    Running,
 }
 
-type MidiInputPortNames = Vec<String>;
-
-#[derive(Clone,Default)]
-struct State {
-    last: Vec<iced_native::Event>,
-    enabled: bool,
-    inputsCount: u32,
-    midiPortNames: MidiInputPortNames,
-    oscPort: u16,
+struct Model {
+    ui: Ui,
+    ids: Ids,
+    resolution: u8,
+    thread_state: ThreadState,
+    sender: Sender<ThreadState>,
+    receiver: Receiver<ThreadState>,
+    midi_receiver: Receiver<MidiMsg>,
 }
 
-#[derive(Debug, Clone)]
-enum Message {
-    EventOccurred(iced_native::Event),
-    Toggled(bool),
-    Loaded(MidiInputPortNames),
-    Tick(Instant),
+widget_ids! {
+    struct Ids {
+        resolution,
+        scale,
+        rotation,
+        random_color,
+        position,
+    }
 }
 
-impl Application for Midiosch {
-    type Executor = executor::Default;
-    type Message = Message;
-    type Flags = ();
+pub enum MidiMsg {
+    NoteOn(u8,u8,u8),
+    NoteOff(u8,u8),
+    ControlChange(u8,u8,u8),
+}
 
-    fn new(_flags: ()) -> (Midiosch, Command<Message>) {
-        (
-            Midiosch::Loading, 
-            Command::perform(midiInit(), Message::Loaded),
-        )
+fn model(app: &App) -> Model {
+
+    let matches = clap::App::new("My Super Program")
+        .version("0.1")
+        .author("Diego Dorado <diegodorado@gmail.com>")
+        .about("Forwards MIDI note and cc to OSC.")
+        .arg(clap::Arg::new("port")
+            .short('p')
+            .long("port")
+            .value_name("PORT")
+            .about("Sets the OSC port to use.")
+            .takes_value(true))
+        .arg(clap::Arg::new("input")
+            .short('i')
+            .long("input")
+            .value_name("MIDI_INPUT_INDEX")
+            .about("Sets the MIDI device index to use.")
+            .takes_value(true))
+        .get_matches();
+
+
+    let port: u16 = matches.value_of_t("port").unwrap_or(9000);
+    let midi_input: Option<u8> = match matches.value_of_t("input") {
+        Ok(v) => Some(v),
+        Err(_) => None,
+    };
+
+    let (sender_t, receiver) = bounded::<ThreadState>(1);
+    let (sender, receiver_t) = bounded::<ThreadState>(1);
+    let (midi_sender, midi_receiver) = unbounded::<MidiMsg>();
+
+    thread::spawn(move || match comm_thread(port, midi_input, sender_t, receiver_t, midi_sender) {
+        Ok(_) => (),
+        Err(err) => println!("Error: {}", err),
+    });
+
+    // Set the loop mode to wait for events, an energy-efficient option for pure-GUI apps.
+    app.set_loop_mode(LoopMode::Wait);
+
+    // Create the UI.
+    let mut ui = app.new_ui().build().unwrap();
+
+    // Generate some ids for our widgets.
+    let ids = Ids::new(ui.widget_id_generator());
+
+    // Init our variables
+    let resolution = 6;
+
+    Model {
+        ui,
+        ids,
+        resolution,
+        thread_state: ThreadState::Loading, 
+        sender, 
+        receiver, 
+        midi_receiver
     }
 
-    fn title(&self) -> String {
-        String::from("State - Iced")
+}
+
+fn update(_app: &App, model: &mut Model, _update: Update) {
+
+    // Calling `set_widgets` allows us to instantiate some widgets.
+    let ui = &mut model.ui.set_widgets();
+
+    match model.receiver.try_recv() {
+        Ok(s) => { model.thread_state = s;}
+        _ => {}
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
-        match self {
-            Midiosch::Loading => {
-                match message {
-                    Message::Loaded(inputs) => {
-                        *self = Midiosch::Loaded( State {
-                            enabled: false,
-                            midiPortNames: inputs,
-                            ..State::default()
-                        });
-                    }
-                    _ => {}
-                };
-
-                Command::none()
-            }
-            Midiosch::Loaded(state) => {
-                match message {
-                    Message::EventOccurred(event) => {
-                        state.last.push(event);
-                        if state.last.len() > 5 {
-                            let _ = state.last.remove(0);
-                        }
-                    }
-                    Message::Toggled(enabled) => {
-                        state.enabled = enabled;
-                    }
-                    Message::Loaded(_) => {}
-                    Message::Tick(_) => {
-                        state.inputsCount = state.inputsCount + 1;
-                    }
-                };
-
-                Command::none()
-            }
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        match self {
-            Midiosch::Loading => Subscription::none(),
-            Midiosch::Loaded(state) => {
-                if state.enabled {
-                    iced_native::subscription::events().map(Message::EventOccurred)
-                } else {
-                    midi::every(Duration::from_millis(1000)).map(Message::Tick)
+    match model.thread_state {
+        ThreadState::Loading => {
+        },
+        ThreadState::SelectPortRequest => {
+        },
+        ThreadState::Running => {
+            let midi_messages: Vec<MidiMsg> = model.midi_receiver.try_iter().collect();
+            for m in midi_messages {
+                match m {
+                    MidiMsg::NoteOn(ch,note,vel) => { println!("note on {} {} {} ", ch,note, vel);}
+                    MidiMsg::NoteOff(ch,note) => { println!("note off {} {}", ch,note);}
+                    MidiMsg::ControlChange(ch,num,val) => { println!("cc {} {} {}", ch,num,val);}
                 }
             }
         }
     }
 
-    fn view(&mut self) -> Element<Message> {
-        match self {
-            Midiosch::Loading => loading_message(),
-            Midiosch::Loaded(state) => {
+}
 
-                let rows = state.last.iter().fold(
-                    Column::new().spacing(10),
-                    |column, event| {
-                        column.push(Text::new(format!("{:?}", event)).size(40))
-                    },
-                );
+fn view(app: &App, model: &Model, frame: Frame) {
 
-                let ports = state.midiPortNames.iter().fold(
-                    Column::new().spacing(10),
-                    |column, name| {
-                        column.push(Text::new(format!("{:?}", name)).size(40))
-                    },
-                );
+    let draw = app.draw();
 
-
-                let toggle = Checkbox::new(
-                    state.enabled,
-                    "Listen to runtime state",
-                    Message::Toggled,
-                );
-
-                let content = Column::new()
-                    .align_items(Align::Center)
-                    .spacing(20)
-                    .push(rows)
-                    .push(ports)
-                    .push(Text::new(state.inputsCount.to_string()).size(50))
-                    .push(toggle);
-
-                Container::new(content)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x()
-                    .center_y()
-                    .into()
-            }
+    match model.thread_state {
+        ThreadState::Loading => {
+            draw.background().color(RED);
+        },
+        ThreadState::SelectPortRequest => {
+            draw.background().color(BLUE);
+        },
+        ThreadState::Running => {
+            draw.background().color(PLUM);
         }
-
     }
 
+    // Write the result of our drawing to the window's frame.
+    draw.to_frame(app, &frame).unwrap();
+
+    // Draw the state of the `Ui` to the frame.
+    model.ui.draw_to_frame(app, &frame).unwrap();
+
 }
 
 
-fn loading_message() -> Element<'static, Message> {
-    Container::new(
-        Text::new("Loading...")
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .size(50),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_y()
-    .into()
-}
 
+pub fn comm_thread(
+        port: u16, 
+        midi_input: Option<u8>, 
+        sender: Sender<ThreadState>, 
+        receiver: Receiver<ThreadState>, 
+        midi_sender: Sender<MidiMsg>
+    ) -> Result<(), Box<dyn Error>> {
 
-async fn midiInit() -> MidiInputPortNames {
-    let mut inputs: MidiInputPortNames = Vec::new();
-    match MidiInput::new("test input"){
-        Ok(midi_in) => {
-            for (i, p) in midi_in.ports().iter().enumerate() {
-                match midi_in.port_name(p){
-                    Ok(name) => {inputs.push(name)}
-                    Err(_) => {}
+    let mut input = String::new();
+    let mut midi_in = MidiInput::new("midir reading input")?;
+    midi_in.ignore(Ignore::None);
+
+    // The osc-sender expects a string in the format "address:port", for example "127.0.0.1:1234"
+    // "127.0.0.1" is equivalent to your computers internal address.
+    let target_addr = format!("{}:{}", "127.0.0.1", port);
+
+    // This is the osc Sender which contains a couple of expectations in case something goes wrong.
+    let osc_sender = osc::sender()
+        .expect("Could not bind to default socket")
+        .connect(target_addr)
+        .expect("Could not connect to socket at address");
+
+    // Get an input port (read from console if multiple are available)
+    let in_ports = midi_in.ports();
+
+    sender.send(ThreadState::SelectPortRequest).unwrap();
+
+    let in_port = match in_ports.len() {
+        0 => return Err("no input port found".into()),
+        1 => {
+            println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
+            &in_ports[0]
+        },
+        _ => {
+            println!("\nAvailable input ports:");
+            for (i, p) in in_ports.iter().enumerate() {
+                println!("{}: {}", i, midi_in.port_name(p).unwrap());
+            }
+            print!("Please select input port: ");
+            stdout().flush()?;
+            let mut input = String::new();
+            stdin().read_line(&mut input)?;
+            in_ports.get(input.trim().parse::<usize>()?)
+                     .ok_or("invalid input port selected")?
+        }
+    };
+
+    println!("\nOpening connection");
+
+    // _conn_in needs to be a named parameter, because it needs to be kept alive until the end of the scope
+    let _conn_in = midi_in.connect(
+        in_port,
+        "midir-read-input",
+        move |_, msg, _| {
+
+            if msg.len() == 3 {
+                if msg[0] == 0x90 {
+                    midi_sender.send(MidiMsg::NoteOn(0,msg[1],msg[2])).unwrap();
+                    let osc_addr = "/circle/position".to_string();
+                    let args = vec![Type::Int(0)];
+                    let packet = (osc_addr, args);
+                    osc_sender.send(packet).ok();
+                } else if msg[0] == 0x80 {
+                    midi_sender.send(MidiMsg::NoteOff(0,msg[1])).unwrap();
+                } else if msg[0] == 0xB0 {
+                    midi_sender.send(MidiMsg::ControlChange(0,msg[1],msg[2])).unwrap();
                 }
             }
-        }
-        Err(_) => {}
-    }
-    inputs
-}
 
+        },
+        (),
+    )?;
 
+    input.clear();
+    stdin().read_line(&mut input)?; // wait for next enter key press
 
-
-
-mod midi {
-    use iced::futures;
-
-    pub fn every(
-        duration: std::time::Duration,
-    ) -> iced::Subscription<std::time::Instant> {
-        iced::Subscription::from_recipe(Every(duration))
-    }
-
-    struct Every(std::time::Duration);
-
-    impl<H, I> iced_native::subscription::Recipe<H, I> for Every
-    where
-        H: std::hash::Hasher,
-    {
-        type Output = std::time::Instant;
-
-        fn hash(&self, state: &mut H) {
-            use std::hash::Hash;
-
-            std::any::TypeId::of::<Self>().hash(state);
-            self.0.hash(state);
-        }
-
-        fn stream(
-            self: Box<Self>,
-            _input: futures::stream::BoxStream<'static, I>,
-        ) -> futures::stream::BoxStream<'static, Self::Output> {
-            use futures::stream::StreamExt;
-
-            async_std::stream::interval(self.0)
-                .map(|_| std::time::Instant::now())
-                .boxed()
-        }
-    }
+    println!("Closing connection");
+    Ok(())
 }
