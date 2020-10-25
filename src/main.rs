@@ -1,16 +1,21 @@
 use nannou_osc as osc;
 use nannou_osc::Type;
-use midir::{MidiInput, Ignore};
+use nannou_osc::Sender;
+use nannou_osc::Connected;
+use midir::{MidiInput, MidiInputConnection, Ignore};
 use clap;
 
-use std::io;
-use tui::Terminal;
-use tui::backend::CrosstermBackend;
 
 use tui::{
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Gauge, Sparkline},
+    layout::{Constraint, Direction, Layout, Corner, Alignment},
+    style::{Color,Style,Modifier},
+    widgets::{
+        canvas::{Canvas},
+        Block, Borders, List, ListItem, Paragraph, Wrap, Row, Table,
+    },
+    text::{Text,Span,Spans},
+    Terminal,
+    backend::CrosstermBackend,
 };
 
 use crossterm::{
@@ -26,6 +31,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use crossbeam_channel::unbounded;
+
+
 
 enum Event<I> {
     Input(I),
@@ -33,44 +41,99 @@ enum Event<I> {
     MidiEvent(Vec<u8>),
 }
 
+#[derive(Debug)]
+enum MidiEvent {
+    ControlChange(u8,u8,u8),
+    NoteOn(u8,u8,u8),
+    NoteOff(u8,u8),
+}
+
 struct App {
-    progress: u16,
-    notes: Vec<u64>,
-    cc: Vec<u64>,
+    midi_input_port_name: String,
+    midi_connection: Option<MidiInputConnection<()>>,
+    osc_sender: Sender<Connected>,
+    events: Vec<(MidiEvent,Vec<String>)>,
 }
 
 impl App {
-    fn new() -> App {
-        let mut notes = vec![0];
-        let mut cc = vec![0];
+    fn setup(midi_input_port_name: String, osc_sender: Sender<Connected>) -> App {
         App {
-            progress: 0,
-            notes,
-            cc,
+            midi_input_port_name,
+            midi_connection: None,
+            osc_sender,
+            events: Vec::new(),
         }
     }
 
     fn update(&mut self) {
-        if(self.notes.len() >=200){
-            self.notes.pop();
+        if self.events.len() >=100 {
+            self.events.truncate(100);
         }
-        self.notes.insert(0, 1);
     }
 
-    fn note_on(&mut self, ch: u8, note: u8, vel: u8) {
-        if(self.notes.len() >=200){
-            self.notes.pop();
-        }
-        self.notes.insert(0, note.into());
-    }
+    fn on_midi(&mut self, ev: MidiEvent) {
 
+        let mut addr = String::new();
+        let mut args = Vec::new();
+
+        match ev {
+            MidiEvent::NoteOff(ch,note) => {
+                addr = format!("/note/{}/{}", ch, note);
+                args.push(Type::Int(0));
+            }
+            MidiEvent::NoteOn(ch,note,vel) => {
+                addr = format!("/note/{}/{}", ch, note);
+                args.push(Type::Int(vel.into()));
+            }
+            MidiEvent::ControlChange(ch,num,val) => {
+                addr = format!("/cc/{}/{}", ch, num);
+                args.push(Type::Int(val.into()));
+            }
+        };
+
+        let packet = (addr.clone(), args);
+        self.osc_sender.send(packet).ok();
+
+        let mut row = match ev {
+            MidiEvent::NoteOff(ch,note) => vec![ "NOTE".to_string(), ch.to_string(), note.to_string(),"-".to_string()],
+            MidiEvent::NoteOn(ch,note,vel) => vec!["NOTE".to_string(), ch.to_string(), note.to_string(), vel.to_string()],
+            MidiEvent::ControlChange(ch,num,val) => vec![ "CC".to_string(), ch.to_string(), num.to_string(), val.to_string()],
+        };
+        row.push(addr);
+        self.events.insert(0, (ev,row));
+
+    }
 
 }
 
 
 fn main() -> Result<(), Box<dyn Error>> {
 
-    let matches = clap::App::new("My Super Program")
+    let logo = r#"
+                            :                         
+                          `sMh`                       
+                         `hMNMd.                      
+                        .dMd.yMN:                     
+                       :mMy`  oNN+                    
+                      +NNo     /NMs`                  
+                    `sMN/       -mMh.                 
+                   `hMm-         .hMd-                
+                  -dMh.           `yMm:               
+                 :mMy`   `.....`    oNN+              
+                +NNo`-+shdddhhhddy+-`/NMs`            
+              `sMNssdmdyo+//////+shmmyomMh.           
+             .hMMNNMmdhmhomMMMNssmhhmMMNMMd-          
+            -dMMMmho:..N+`NMMMM+`Mo.-+ymMMMm:         
+           :mMhmMNo.   sm-/yhho-ym.  .+mMmyNN+        
+          +NM+``/hNNh+-`/yhsosyho.-+hNNd+. /NMs`      
+        `sMN/     .+hmNmdyssyssyhmNNho-`    -mMh`     
+       `hMm-         `-/syhdddhys+-`         .hMd-    
+      .mMh.                                   `sMN:   
+     :NMMyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyNMN+  
+    `ossssssssssssssssssssssssssssssssssssssssssssso- 
+    "#;
+
+    let matches = clap::App::new("MIDIOSCH")
         .version("0.1")
         .author("Diego Dorado <diegodorado@gmail.com>")
         .about("Forwards MIDI note and cc to OSC.")
@@ -94,25 +157,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         Err(_) => None,
     };
 
-    let mut midi_in = MidiInput::new("midir reading input")?;
-    midi_in.ignore(Ignore::None);
-
     let target_addr = format!("{}:{}", "127.0.0.1", port);
     let osc_sender = osc::sender()
         .expect("Could not bind to default socket")
         .connect(target_addr)
         .expect("Could not connect to socket at address");
 
+    let mut midi_in = MidiInput::new("midir reading input")?;
+    midi_in.ignore(Ignore::None);
     // Get an input port (read from console if multiple are available)
     let in_ports = midi_in.ports();
-
     let in_port = match in_ports.len() {
         0 => return Err("no input port found".into()),
         _ => {
             match midi_input {
                 Some(index) => {
-                    if(index < in_ports.len()){
-                        println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
+                    if index < in_ports.len() {
                         &in_ports[index]
                     }
                     else{
@@ -120,8 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 None => {
-                    if(in_ports.len()==1){
-                        println!("Choosing the only available input port: {}", midi_in.port_name(&in_ports[0]).unwrap());
+                    if in_ports.len() == 1 {
                         &in_ports[0]
                     }
                     else{
@@ -141,90 +200,109 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    enable_raw_mode()?;
-    // Terminal initialization
-    let mut stdout = stdout();
 
-    execute!(stdout, EnableMouseCapture)?;
+    let portname =  format!("{}", midi_in.port_name(&in_ports[0]).unwrap());
 
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut app = App::setup(portname, osc_sender);
 
     // Setup input handling
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = unbounded();
 
-    let tx2 = tx.clone();
+    {
+        let tx = tx.clone();
+        let tick_rate = Duration::from_millis(200);
+        thread::spawn(move || {
+            let mut last_tick = Instant::now();
+            loop {
+                // poll for tick rate duration, if no events, sent tick event.
+                let timeout = tick_rate
+                    .checked_sub(last_tick.elapsed())
+                    .unwrap_or_else(|| Duration::from_secs(0));
+                if event::poll(timeout).unwrap() {
+                    if let CEvent::Key(key) = event::read().unwrap() {
+                        tx.send(Event::Input(key)).unwrap();
+                    }
+                }
+                if last_tick.elapsed() >= tick_rate {
+                    tx.send(Event::Tick).unwrap();
+                    last_tick = Instant::now();
+                }
+            }
+        });
+    }
+
+
     // _conn_in needs to be a named parameter, because it needs to be kept alive until the end of the scope
-    let _conn_in = midi_in.connect(
+    app.midi_connection = match midi_in.connect(
         in_port,
         "midir-read-input",
         move |_, msg, _| {
-            tx2.send(Event::MidiEvent(msg.to_vec())).unwrap();
+            tx.send(Event::MidiEvent(msg.to_vec())).unwrap();
         },
         (),
-    )?;
+    ){
+        Ok(v) => Some(v),
+        Err(_) => None,
+    };
 
-    let tick_rate = Duration::from_millis(200);
-    thread::spawn(move || {
-        let mut last_tick = Instant::now();
-        loop {
-            // poll for tick rate duration, if no events, sent tick event.
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or_else(|| Duration::from_secs(0));
-            if event::poll(timeout).unwrap() {
-                if let CEvent::Key(key) = event::read().unwrap() {
-                    tx.send(Event::Input(key)).unwrap();
-                }
-            }
-            if last_tick.elapsed() >= tick_rate {
-                tx.send(Event::Tick).unwrap();
-                last_tick = Instant::now();
-            }
-        }
-    });
-
-    let mut app = App::new();
+    enable_raw_mode()?;
+    // Terminal initialization
+    let mut _stdout = stdout();
+    execute!(_stdout, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(_stdout);
+    let mut terminal = Terminal::new(backend)?;
 
     terminal.clear()?;
 
-    loop {
+    'main: loop {
+
         terminal.draw(|f| {
             let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(2)
-                .constraints(
-                    [
-                        Constraint::Percentage(25),
-                        Constraint::Percentage(25),
-                        Constraint::Length(3),
-                        Constraint::Length(3),
-                        Constraint::Length(7),
-                        Constraint::Min(0),
-                    ]
-                    .as_ref(),
-                )
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
                 .split(f.size());
 
-            let sparkline = Sparkline::default()
-                .block(
-                    Block::default()
-                        .title("NOTES")
-                        .borders(Borders::LEFT | Borders::RIGHT),
-                )
-                .data(&app.notes)
-                .max(127)
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(sparkline, chunks[0]);
+            let create_block = |title| {
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(title, Style::default()))
+            };
+            let text = Text::from(format!("{}\n\nConnected to {}\n\n Press 'Q' to exit. ", logo, app.midi_input_port_name));
+            let paragraph = Paragraph::new(text.clone())
+                .block(create_block("MIDIOSCH"))
+                .alignment(Alignment::Center);
+            f.render_widget(paragraph, chunks[0]);
+
+            let style = Style::default();
+            let rows = app
+                .events
+                .iter()
+                .map(|(ev,row)|  Row::StyledData(row.iter(), style));
+
+            let header = ["TYPE","CHAN", "DATA1", "DATA2", "ADDR"];
+            let table = Table::new(header.iter(), rows)
+                .block(Block::default().borders(Borders::ALL).title("EVENTS"))
+                .widths(&[
+                    Constraint::Length(6),
+                    Constraint::Length(4),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Min(20),
+                ]);
+
+            f.render_widget(table, chunks[1]);
 
         })?;
 
+
+        //fixme: cant find a way to consume all messages
+        //without hoging the cpu
+        //... tried with try_recv(),
+        //  and messages are not delayed, but it is to heavy on the cpu
         match rx.recv()? {
             Event::Input(event) => match event.code {
                 KeyCode::Char('q') => {
-                    terminal.clear()?;
-                    break;
+                    break 'main;
                 }
                 _ => {}
             },
@@ -233,26 +311,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
             Event::MidiEvent(msg) => {
                 if msg.len() == 3 {
-                    if msg[0] == 0x90 {
-                        let ch = msg[0];
-                        let note = msg[1];
-                        let vel = msg[2];
-                        let addr = format!("/note/{}/{}", ch, note);
-                        let args = vec![Type::Int(vel.into())];
-                        let packet = (addr, args);
-                        osc_sender.send(packet).ok();
-                        app.note_on(ch, note, vel);
-                    } else if msg[0] == 0x80 {
-                    } else if msg[0] == 0xB0 {
+                    let msg_type = msg[0] & 0xF0;
+                    let ch = msg[0] & 0x0F;
+                    let data1 = msg[1];
+                    let data2 = msg[2];
+                    let ev = match msg_type {
+                        0x80 => Some(MidiEvent::NoteOff(ch,data1)),
+                        0x90 => Some(MidiEvent::NoteOn(ch,data1,data2)),
+                        0xB0 => Some(MidiEvent::ControlChange(ch,data1,data2)),
+                        _ => None,
+                    };
+                    if let Some(ev) = ev { 
+                        app.on_midi(ev);
                     }
                 }
-
             }
         }
 
     }
 
+    // cleanup
+    if let Some(mc) = app.midi_connection {
+        mc.close();
+    }
+    terminal.clear()?;
     disable_raw_mode();
+    println!("{}",logo);
 
     Ok(())
 }
