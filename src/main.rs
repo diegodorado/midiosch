@@ -7,13 +7,12 @@ use clap;
 
 
 use tui::{
-    layout::{Constraint, Direction, Layout, Corner, Alignment},
-    style::{Color,Style,Modifier},
+    layout::{Constraint, Direction, Layout, Alignment},
+    style::{Style},
     widgets::{
-        canvas::{Canvas},
-        Block, Borders, List, ListItem, Paragraph, Wrap, Row, Table,
+        Block, Borders, Paragraph, Row, Table,
     },
-    text::{Text,Span,Spans},
+    text::{Text,Span},
     Terminal,
     backend::CrosstermBackend,
 };
@@ -27,7 +26,6 @@ use crossterm::{
 use std::{
     error::Error,
     io::{stdin, stdout, Write},
-    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -73,7 +71,7 @@ impl App {
 
     fn on_midi(&mut self, ev: MidiEvent) {
 
-        let mut addr = String::new();
+        let addr;
         let mut args = Vec::new();
 
         match ev {
@@ -254,6 +252,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     terminal.clear()?;
 
+    let left_text = Text::from(format!(
+            r#"{}
+            
+            Connected to {}
+
+            Sending OSC to 127.0.0.1:{}
+
+            Press 'Q' to exit. 
+            "#, logo, app.midi_input_port_name, port));
+
     'main: loop {
 
         terminal.draw(|f| {
@@ -267,8 +275,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .borders(Borders::ALL)
                     .title(Span::styled(title, Style::default()))
             };
-            let text = Text::from(format!("{}\n\nConnected to {}\n\n Press 'Q' to exit. ", logo, app.midi_input_port_name));
-            let paragraph = Paragraph::new(text.clone())
+            let paragraph = Paragraph::new(left_text.clone())
                 .block(create_block("MIDIOSCH"))
                 .alignment(Alignment::Center);
             f.render_widget(paragraph, chunks[0]);
@@ -277,7 +284,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let rows = app
                 .events
                 .iter()
-                .map(|(ev,row)|  Row::StyledData(row.iter(), style));
+                .map(|(_ev,row)|  Row::StyledData(row.iter(), style));
 
             let header = ["TYPE","CHAN", "DATA1", "DATA2", "ADDR"];
             let table = Table::new(header.iter(), rows)
@@ -335,8 +342,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         mc.close();
     }
     terminal.clear()?;
-    disable_raw_mode();
-    println!("{}",logo);
+    disable_raw_mode()?;
+    println!("See you!\n\n{}",logo);
 
     Ok(())
 }
