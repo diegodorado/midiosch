@@ -50,15 +50,17 @@ struct App {
     midi_input_port_name: String,
     midi_connection: Option<MidiInputConnection<()>>,
     osc_sender: Sender<Connected>,
+    normalize: bool,
     events: Vec<(MidiEvent,Vec<String>)>,
 }
 
 impl App {
-    fn setup(midi_input_port_name: String, osc_sender: Sender<Connected>) -> App {
+    fn setup(midi_input_port_name: String, osc_sender: Sender<Connected>, normalize : bool) -> App {
         App {
             midi_input_port_name,
             midi_connection: None,
             osc_sender,
+            normalize,
             events: Vec::new(),
         }
     }
@@ -72,32 +74,43 @@ impl App {
     fn on_midi(&mut self, ev: MidiEvent) {
 
         let addr;
+        let ivalue;
         let mut args = Vec::new();
 
         match ev {
             MidiEvent::NoteOff(ch,note) => {
                 addr = format!("/note/{}/{}", ch, note);
-                args.push(Type::Int(0));
+                ivalue = 0;
             }
             MidiEvent::NoteOn(ch,note,vel) => {
                 addr = format!("/note/{}/{}", ch, note);
-                args.push(Type::Int(vel.into()));
+                ivalue = vel.into();
             }
             MidiEvent::ControlChange(ch,num,val) => {
                 addr = format!("/cc/{}/{}", ch, num);
-                args.push(Type::Int(val.into()));
+                ivalue = val.into();
             }
         };
-
-        let packet = (addr.clone(), args);
-        self.osc_sender.send(packet).ok();
 
         let mut row = match ev {
             MidiEvent::NoteOff(ch,note) => vec![ "NOTE".to_string(), ch.to_string(), note.to_string(),"-".to_string()],
             MidiEvent::NoteOn(ch,note,vel) => vec!["NOTE".to_string(), ch.to_string(), note.to_string(), vel.to_string()],
             MidiEvent::ControlChange(ch,num,val) => vec![ "CC".to_string(), ch.to_string(), num.to_string(), val.to_string()],
         };
-        row.push(addr);
+        row.push(addr.clone());
+
+
+        if self.normalize {
+            let value = (ivalue as f32) / 127.0;
+            row.push(value.to_string());
+            args.push(Type::Float(value));
+        }else{
+            row.push(ivalue.to_string());
+            args.push(Type::Int(ivalue));
+        }
+
+        let packet = (addr, args);
+        self.osc_sender.send(packet).ok();
         self.events.insert(0, (ev,row));
 
     }
@@ -147,6 +160,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             .value_name("MIDI_INPUT_INDEX")
             .about("Sets the MIDI device index to use.")
             .takes_value(true))
+        .arg(clap::Arg::new("normalize")
+            .short('n')
+            .long("normalize")
+            .value_name("NORMALIZE")
+            .about("Whether to normalize 0-127 values to a float between 0 and 1.")
+            .takes_value(true))
         .get_matches();
 
     let port: u16 = matches.value_of_t("port").unwrap_or(9000);
@@ -154,6 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(v) => Some(v),
         Err(_) => None,
     };
+    let normalize: bool = matches.value_of_t("normalize").unwrap_or(true);
 
     let target_addr = format!("{}:{}", "127.0.0.1", port);
     let osc_sender = osc::sender()
@@ -201,7 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let portname =  format!("{}", midi_in.port_name(&in_ports[0]).unwrap());
 
-    let mut app = App::setup(portname, osc_sender);
+    let mut app = App::setup(portname, osc_sender, normalize);
 
     // Setup input handling
     let (tx, rx) = unbounded();
@@ -286,7 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .iter()
                 .map(|(_ev,row)|  Row::StyledData(row.iter(), style));
 
-            let header = ["TYPE","CHAN", "DATA1", "DATA2", "ADDR"];
+            let header = ["TYPE","CHAN", "DATA1", "DATA2", "ADDR", "VAL"];
             let table = Table::new(header.iter(), rows)
                 .block(Block::default().borders(Borders::ALL).title("EVENTS"))
                 .widths(&[
@@ -294,7 +314,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Constraint::Length(4),
                     Constraint::Length(5),
                     Constraint::Length(5),
-                    Constraint::Min(20),
+                    Constraint::Min(13),
+                    Constraint::Min(5),
                 ]);
 
             f.render_widget(table, chunks[1]);
@@ -343,7 +364,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     terminal.clear()?;
     disable_raw_mode()?;
-    println!("See you!\n\n{}",logo);
+    println!("\n\n          See you!\n\n{}",logo);
 
     Ok(())
 }
