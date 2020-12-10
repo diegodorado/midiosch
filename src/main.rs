@@ -4,7 +4,7 @@ use nannou_osc::Sender;
 use nannou_osc::Connected;
 use midir::{MidiInput, MidiInputConnection, Ignore};
 use clap;
-
+use std::collections::HashMap;
 
 use tui::{
     layout::{Constraint, Direction, Layout, Alignment},
@@ -32,7 +32,6 @@ use std::{
 use crossbeam_channel::unbounded;
 
 
-
 enum Event<I> {
     Input(I),
     Tick,
@@ -51,7 +50,7 @@ struct App {
     midi_connection: Option<MidiInputConnection<()>>,
     osc_sender: Sender<Connected>,
     normalize: bool,
-    events: Vec<(MidiEvent,Vec<String>)>,
+    events: HashMap<String,(Instant,String)>,
 }
 
 impl App {
@@ -61,14 +60,22 @@ impl App {
             midi_connection: None,
             osc_sender,
             normalize,
-            events: Vec::new(),
+            events: HashMap::new(),
         }
     }
 
     fn update(&mut self) {
-        if self.events.len() >=100 {
-            self.events.truncate(100);
-        }
+
+        let keep_for = Duration::from_millis(10000);
+
+        let oldies: Vec<_> = self.events
+            .iter()
+            .filter(|(_,(t,_))| t.elapsed() > keep_for)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for old in oldies { self.events.remove(&old);}
+
     }
 
     fn on_midi(&mut self, ev: MidiEvent) {
@@ -92,27 +99,17 @@ impl App {
             }
         };
 
-        let mut row = match ev {
-            MidiEvent::NoteOff(ch,note) => vec![ "NOTE".to_string(), ch.to_string(), note.to_string(),"-".to_string()],
-            MidiEvent::NoteOn(ch,note,vel) => vec!["NOTE".to_string(), ch.to_string(), note.to_string(), vel.to_string()],
-            MidiEvent::ControlChange(ch,num,val) => vec![ "CC".to_string(), ch.to_string(), num.to_string(), val.to_string()],
-        };
-        row.push(addr.clone());
-
-
+        let now = Instant::now();
         if self.normalize {
             let value = (ivalue as f32) / 127.0;
-            row.push(value.to_string());
             args.push(Type::Float(value));
+            self.events.insert(addr.clone(), (now,value.to_string()));
         }else{
-            row.push(ivalue.to_string());
             args.push(Type::Int(ivalue));
+            self.events.insert(addr.clone(), (now,ivalue.to_string()));
         }
-
         let packet = (addr, args);
         self.osc_sender.send(packet).ok();
-        self.events.insert(0, (ev,row));
-
     }
 
 }
@@ -190,12 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => {
             match midi_input {
                 Some(index) => {
-                    if index < in_ports.len() {
-                        &in_ports[index]
-                    }
-                    else{
-                        return Err("input port out of range".into());
-                    }
+                    in_ports.get(index).ok_or("invalid input index ")?
                 }
                 None => {
                     if in_ports.len() == 1 {
@@ -219,7 +211,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
 
-    let portname =  format!("{}", midi_in.port_name(&in_ports[0]).unwrap());
+    let portname =  format!("{}", midi_in.port_name(in_port).unwrap());
 
     let mut app = App::setup(portname, osc_sender, normalize);
 
@@ -228,7 +220,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     {
         let tx = tx.clone();
-        let tick_rate = Duration::from_millis(200);
+        let tick_rate = Duration::from_millis(60);
         thread::spawn(move || {
             let mut last_tick = Instant::now();
             loop {
@@ -284,45 +276,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     'main: loop {
 
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-                .split(f.size());
-
-            let create_block = |title| {
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(Span::styled(title, Style::default()))
-            };
-            let paragraph = Paragraph::new(left_text.clone())
-                .block(create_block("MIDIOSCH"))
-                .alignment(Alignment::Center);
-            f.render_widget(paragraph, chunks[0]);
-
-            let style = Style::default();
-            let rows = app
-                .events
-                .iter()
-                .map(|(_ev,row)|  Row::StyledData(row.iter(), style));
-
-            let header = ["TYPE","CHAN", "DATA1", "DATA2", "ADDR", "VAL"];
-            let table = Table::new(header.iter(), rows)
-                .block(Block::default().borders(Borders::ALL).title("EVENTS"))
-                .widths(&[
-                    Constraint::Length(6),
-                    Constraint::Length(4),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Min(13),
-                    Constraint::Min(5),
-                ]);
-
-            f.render_widget(table, chunks[1]);
-
-        })?;
-
-
         //fixme: cant find a way to consume all messages
         //without hoging the cpu
         //... tried with try_recv(),
@@ -336,6 +289,40 @@ fn main() -> Result<(), Box<dyn Error>> {
             },
             Event::Tick => {
                 app.update();
+
+                terminal.draw(|f| {
+
+                    let create_block = |title| {
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(Span::styled(title, Style::default()))
+                    };
+                    let paragraph = Paragraph::new(left_text.clone())
+                        .block(create_block("MIDIOSCH"))
+                        .alignment(Alignment::Center);
+                    let chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+                        .split(f.size());
+                    f.render_widget(paragraph, chunks[0]);
+                    let style = Style::default();
+
+                    let mut rows = Vec::new();
+                    for (k,(_,v)) in app.events.iter() {
+                        let row = vec![k,v];
+                        rows.push(Row::StyledData(row.into_iter(), style) );
+                    }
+
+                    let table = Table::new(["ADDR", "VAL"].iter(), rows.into_iter())
+                    .block(Block::default().borders(Borders::ALL).title("EVENTS"))
+                    .widths(&[
+                        Constraint::Min(13),
+                        Constraint::Min(5),
+                    ]);
+
+                    f.render_widget(table, chunks[1]);
+                });
+
             },
             Event::MidiEvent(msg) => {
                 if msg.len() == 3 {
@@ -362,9 +349,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(mc) = app.midi_connection {
         mc.close();
     }
-    terminal.clear()?;
     disable_raw_mode()?;
-    println!("\n\n          See you!\n\n{}",logo);
+    terminal.clear()?;
 
     Ok(())
 }
